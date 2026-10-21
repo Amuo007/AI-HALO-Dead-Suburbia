@@ -1055,6 +1055,8 @@ async function init() {
     player.pos.set(sx, 0, sz);
     if (VIEW === 'zombies') player.pos.set(0, 0, 0.5);
     player.yaw = 0; player.pitch = -0.05;
+    if (VIEW === 'ads') { aiming = true; vm.adsAmt = 1; }
+    if (VIEW === 'weapon') { player.pitch = -0.25; }
     if (DEMO) $('hud').classList.add('on');
     updateHudWeapon(); updateHudTop();
   }
@@ -1147,6 +1149,7 @@ function loop() {
   }
 
   // ADS
+  if (VIEW === 'ads') { aiming = true; vm.adsAmt = 1; }
   const adsTarget = aiming ? 1 : 0;
   vm.adsAmt += (adsTarget - vm.adsAmt) * Math.min(1, dt * 10);
   camera.fov = 75 - (WEAPONS[curWeapon].scope ? 45 : 20) * vm.adsAmt;
