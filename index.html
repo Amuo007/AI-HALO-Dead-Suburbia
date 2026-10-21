@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Dead Suburbia</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; background:#000; font-family:'Segoe UI',Arial,sans-serif; color:#eee; }
+  #c { position:fixed; inset:0; width:100%; height:100%; display:block; }
+
+  /* ---------- HUD ---------- */
+  #hud { position:fixed; inset:0; pointer-events:none; display:none; }
+  #hud.on { display:block; }
+  #crosshair { position:absolute; left:50%; top:50%; width:0; height:0; }
+  #crosshair .ch { position:absolute; background:#8f8; box-shadow:0 0 3px #000; }
+  #hitmarker { position:absolute; left:50%; top:50%; transform:translate(-50%,-50%); font-size:26px; font-weight:bold; color:#fff; opacity:0; text-shadow:0 0 4px #000; }
+  #hitmarker.head { color:#ffd24a; }
+  #hitmarker.kill { color:#ff4a4a; }
+  #headshotTxt { position:absolute; left:50%; top:38%; transform:translateX(-50%); color:#ffd24a; font-weight:900; font-size:26px; letter-spacing:3px; opacity:0; text-shadow:0 0 8px #000; }
+  #streakTxt { position:absolute; left:50%; top:30%; transform:translateX(-50%); color:#ff9d2a; font-weight:900; font-size:32px; letter-spacing:4px; opacity:0; text-shadow:0 0 10px #000; }
+  .dmgnum { position:absolute; color:#fff; font-weight:bold; font-size:18px; text-shadow:0 0 4px #000; pointer-events:none; }
+  .dmgnum.head { color:#ffd24a; font-size:24px; }
+
+  #vignette { position:fixed; inset:0; pointer-events:none; opacity:0;
+    background:radial-gradient(ellipse at center, transparent 45%, rgba(255,0,0,.55) 100%); }
+  #dmgArrow { position:absolute; left:50%; top:50%; width:0; height:0; opacity:0; }
+  #dmgArrow .arr { position:absolute; left:-14px; top:-120px; width:0; height:0;
+    border-left:14px solid transparent; border-right:14px solid transparent; border-bottom:22px solid rgba(255,60,60,.9); transform-origin:14px 120px; }
+
+  #healthBar { position:absolute; left:24px; bottom:24px; width:260px; }
+  #healthBar .lab { font-size:12px; letter-spacing:2px; color:#9f9; margin-bottom:3px; }
+  .barbg { height:16px; background:rgba(0,0,0,.55); border:1px solid rgba(255,255,255,.25); }
+  #healthFill { height:100%; width:100%; background:linear-gradient(90deg,#1d7,#5f5); transition:width .15s; }
+  #staminaBar { position:absolute; left:24px; bottom:70px; width:200px; }
+  #staminaFill { height:100%; width:100%; background:#3af; }
+  #staminaBar .barbg { height:8px; }
+
+  #ammoBox { position:absolute; right:28px; bottom:24px; text-align:right; }
+  #ammoClip { font-size:44px; font-weight:900; text-shadow:0 0 6px #000; }
+  #ammoReserve { font-size:18px; color:#aaa; }
+  #weaponName { font-size:14px; letter-spacing:2px; color:#8f8; }
+  #wslots { position:absolute; right:28px; bottom:110px; display:flex; gap:8px; }
+  .wslot { padding:3px 9px; background:rgba(0,0,0,.5); border:1px solid #555; font-size:12px; color:#888; }
+  .wslot.cur { border-color:#5f5; color:#5f5; }
+  .wslot.locked { opacity:.35; }
+
+  #topBar { position:absolute; top:14px; left:50%; transform:translateX(-50%); display:flex; gap:26px; text-align:center; text-shadow:0 0 5px #000; }
+  #topBar .v { font-size:26px; font-weight:900; }
+  #topBar .l { font-size:11px; letter-spacing:2px; color:#aaa; }
+  #scoreVal { color:#ffd24a; }
+  #comboTag { color:#ff9d2a; font-size:13px; }
+
+  #minimap { position:absolute; top:14px; right:14px; width:170px; height:170px; background:rgba(0,0,10,.55); border:1px solid rgba(255,255,255,.25); border-radius:4px; }
+
+  #scopeOverlay { position:fixed; inset:0; pointer-events:none; display:none; }
+  #scopeOverlay.on { display:block; }
+  #scopeOverlay .ring { position:absolute; left:50%; top:50%; width:150vmax; height:150vmax; transform:translate(-50%,-50%); border-radius:50%; box-shadow:0 0 0 200vmax #000; }
+  #scopeOverlay .cross { position:absolute; left:50%; top:50%; width:2px; height:100%; transform:translateX(-50%); background:rgba(0,0,0,.7); }
+  #scopeOverlay .cross2 { position:absolute; left:50%; top:50%; height:2px; width:100%; transform:translateY(-50%); background:rgba(0,0,0,.7); }
+
+  #reloadTxt { position:absolute; left:50%; top:58%; transform:translateX(-50%); color:#ccc; letter-spacing:3px; font-size:14px; opacity:0; }
+
+  /* ---------- Screens ---------- */
+  .screen { position:fixed; inset:0; display:none; flex-direction:column; align-items:center; justify-content:center;
+    background:linear-gradient(rgba(5,8,12,.55), rgba(5,8,12,.85)); z-index:20; }
+  .screen.on { display:flex; }
+  .screen h1 { font-size:64px; letter-spacing:8px; color:#c22; text-shadow:0 0 24px #700, 0 2px 0 #000; font-weight:900; }
+  .screen h2 { font-size:20px; color:#9c9; letter-spacing:6px; margin-bottom:34px; }
+  .menu { display:flex; flex-direction:column; gap:12px; align-items:center; }
+  .btn { pointer-events:auto; cursor:pointer; background:rgba(20,30,20,.8); border:1px solid #484; color:#cec; padding:12px 46px; font-size:18px; letter-spacing:3px; }
+  .btn:hover { background:#243824; border-color:#8c8; }
+  .ctrls { margin-top:30px; color:#9ab; font-size:13px; line-height:1.9; text-align:center; }
+  .credits { margin-top:22px; color:#667; font-size:11px; text-align:center; line-height:1.6; }
+  .row { display:flex; align-items:center; gap:10px; font-size:14px; color:#bcd; }
+  .row input { pointer-events:auto; }
+  #gameover h1 { color:#a22; }
+  #goStats { font-size:20px; line-height:2; text-align:center; margin-bottom:20px; }
+  #buyMenu { z-index:21; }
+  #buyGrid { display:grid; grid-template-columns:repeat(3,190px); gap:12px; margin:20px 0; }
+  .buyItem { pointer-events:auto; cursor:pointer; background:rgba(15,22,15,.9); border:1px solid #464; padding:14px; text-align:center; }
+  .buyItem:hover { border-color:#8c8; }
+  .buyItem .bi-name { font-size:15px; color:#cec; }
+  .buyItem .bi-cost { color:#ffd24a; margin-top:6px; }
+  #waveBanner { position:fixed; left:50%; top:26%; transform:translateX(-50%); font-size:44px; font-weight:900; letter-spacing:6px; color:#c33; text-shadow:0 0 20px #500; opacity:0; pointer-events:none; z-index:15; }
+  #breakBanner { position:fixed; left:50%; top:20%; transform:translateX(-50%); text-align:center; font-size:22px; color:#9c9; opacity:0; pointer-events:none; z-index:15; text-shadow:0 0 8px #000; }
+  #muteTag { position:fixed; top:8px; left:50%; transform:translateX(-50%); color:#888; font-size:12px; display:none; z-index:30; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+
+<div id="hud">
+  <div id="crosshair"></div>
+  <div id="hitmarker"></div>
+  <div id="headshotTxt">HEADSHOT</div>
+  <div id="streakTxt"></div>
+  <div id="reloadTxt">RELOADING</div>
+  <div id="healthBar"><div class="lab">HEALTH</div><div class="barbg"><div id="healthFill"></div></div></div>
+  <div id="staminaBar"><div class="barbg"><div id="staminaFill"></div></div></div>
+  <div id="ammoBox"><div id="weaponName">RIFLE</div><div><span id="ammoClip">30</span> <span id="ammoReserve">/ 120</span></div></div>
+  <div id="wslots"></div>
+  <div id="topBar">
+    <div><div class="v" id="waveVal">1</div><div class="l">WAVE</div></div>
+    <div><div class="v" id="killsVal">0</div><div class="l">KILLS</div></div>
+    <div><div class="v" id="scoreVal">0</div><div class="l" id="comboTag">SCORE</div></div>
+  </div>
+  <canvas id="minimap" width="170" height="170"></canvas>
+</div>
+<div id="vignette"></div>
+<div id="dmgArrow"><div class="arr"></div></div>
+<div id="scopeOverlay"><div class="ring"></div><div class="cross"></div><div class="cross2"></div></div>
+<div id="waveBanner"></div>
+<div id="breakBanner"></div>
+<div id="muteTag">MUTED</div>
+
+<div id="startScreen" class="screen on">
+  <h1>DEAD SUBURBIA</h1>
+  <h2>SURVIVE THE NIGHT</h2>
+  <div class="menu">
+    <button class="btn" id="btnStart">START</button>
+    <button class="btn" id="btnPauseShow">OPTIONS</button>
+  </div>
+  <div class="ctrls">WASD move &nbsp;•&nbsp; Shift sprint &nbsp;•&nbsp; Space jump &nbsp;•&nbsp; C crouch &nbsp;•&nbsp; F flashlight<br>
+  Mouse shoot &nbsp;•&nbsp; RMB aim &nbsp;•&nbsp; R reload &nbsp;•&nbsp; 1-4 weapons &nbsp;•&nbsp; G grenade &nbsp;•&nbsp; V melee &nbsp;•&nbsp; M mute</div>
+  <div class="credits">Assets: Kenney.nl (CC0) — city kit, blaster kit, animated characters.<br>Built by Qwen on an AMD Strix Halo with OpenCode.</div>
+</div>
+
+<div id="pauseScreen" class="screen">
+  <h1 style="font-size:44px">PAUSED</h1>
+  <div class="menu">
+    <div class="row">Mouse sensitivity <input id="sensSlider" type="range" min="20" max="300" value="100"></div>
+    <div class="row">Volume <input id="volSlider" type="range" min="0" max="100" value="80"></div>
+    <button class="btn" id="btnResume">RESUME</button>
+    <button class="btn" id="btnQuit">QUIT TO MENU</button>
+  </div>
+</div>
+
+<div id="gameover" class="screen">
+  <h1>YOU DIED</h1>
+  <div id="goStats"></div>
+  <div class="menu"><button class="btn" id="btnRetry">RETRY</button></div>
+</div>
+
+<div id="buyMenu" class="screen">
+  <h2 id="buyTitle">BUY STATION — <span id="buyCash">0</span> PTS — closes in <span id="buyTimer">0</span>s</h2>
+  <div id="buyGrid"></div>
+  <button class="btn" id="btnBuyClose">CLOSE</button>
+</div>
+
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+}}
+</script>
+<script type="module" src="src/main.js"></script>
+</body>
+</html>
