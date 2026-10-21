@@ -75,6 +75,9 @@ export class Zombie {
       }
     });
     this.bones = {};
+    this.mats = [];
+    this.mesh.traverse(o => { if (o.isMesh) { this.mats.push(o.material); o.material.emissive = new THREE.Color(0, 0, 0); } });
+    this.flashT = 0;
     this.mesh.traverse(o => { if (o.isBone && BONE_NAMES.includes(o.name)) this.bones[o.name] = o; });
 
     this.mixer = new THREE.AnimationMixer(this.mesh);
@@ -146,6 +149,11 @@ export class Zombie {
 
   update(dt) {
     const a = this.a, p = this.p;
+    if (this.flashT > 0) {
+      this.flashT -= dt;
+      const f = Math.max(0, this.flashT / 0.08);
+      for (const m of this.mats) m.emissive.setRGB(f, f, f);
+    }
     if (!a.freeze) a.time += dt;
     const t = a.time;
     const dead = !!a.death;
