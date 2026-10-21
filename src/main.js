@@ -9,6 +9,11 @@ import { buildMap } from './map.js';
 import { Effects } from './effects.js';
 import { WEAPONS, WEAPON_ORDER, createAmmo, canFire, fireShot, startReload, tickReload, tickCooldown, currentSpread, recoilStep, resetRecoil, lowAmmo } from './logic/weapons.js';
 import { applyHit, makeCombatStats, scoreForKill } from './logic/damage.js';
+import { TYPES, typeStats } from './logic/types.js';
+import { canSee, hears } from './logic/senses.js';
+import { createAI, updateAI, onHit as aiOnHit, onKnockdown as aiOnKnock, onDead as aiOnDead, S } from './logic/zombieAI.js';
+import { makeSlots, claimSlot, releaseSlot, slotPos, shouldFlank } from './logic/surround.js';
+import { flowField, flowDir, cellOf } from './logic/nav.js';
 
 const params = new URLSearchParams(location.search);
 const DEMO = params.has('demo');
@@ -91,6 +96,8 @@ async function loadAssets() {
   skinC = makeZombieSkin(texLoader, ASSET + 'Skins/zombieC.png');
   mapWorld = await buildMap(scene, map, gltfLoader);
   rebuildWorldRay();
+  buildSightBoxes();
+  rebuildFlow();
   const guns = {};
   await Promise.all(WEAPON_ORDER.map(async id => {
     console.log('[gun]', id);
@@ -103,13 +110,242 @@ async function loadAssets() {
 }
 
 function spawnZombie(x, z, skin, opts = {}) {
-  const zom = new Zombie(zombieTemplate, skin, opts);
+  const type = opts.type || 'walker';
+  const ts = typeStats(type);
+  const zom = new Zombie(zombieTemplate, skin, {
+    tint: opts.tint !== undefined ? opts.tint : ts.tint,
+    sizeMul: (opts.sizeMul || 1) * ts.size,
+    hp: opts.hp || ts.hp,
+  });
   zom.root.position.set(x, 0, z);
-  zom.stats = makeCombatStats(opts.hp || 100);
-  zom.speedMul = opts.speed || 1;
+  zom.stats = makeCombatStats(opts.hp || ts.hp);
+  zom.type = type;
+  zom.ts = ts;
+  zom.ai = createAI(type);
+  zom.speedMul = ts.speed;
+  zom.aiSlot = -1;
   scene.add(zom.root);
   zombies.push(zom);
   return zom;
+}
+
+// ---------- AI world ----------
+const aiSlots = makeSlots();
+let flowDist = null, flowTimer = 0;
+const projectiles = [];
+const puddles = [];
+let hordeAlert = 0;
+
+function rebuildFlow() {
+  flowDist = flowField(navGrid, player.pos.x, player.pos.z);
+}
+
+function alertNearby(x, z, radius) {
+  for (const z2 of zombies) {
+    if (!z2.stats.alive) continue;
+    const d = Math.hypot(z2.root.position.x - x, z2.root.position.z - z);
+    if (d <= radius) {
+      z2.ai.alerted = true;
+      z2.stats.memX = player.pos.x; z2.stats.memZ = player.pos.z; z2.stats.memValid = true;
+      if (z2.ai.state === S.IDLE || z2.ai.state === S.WANDER) { z2.ai.state = S.ALERT; z2.ai.t = 0; }
+    }
+  }
+}
+
+function noiseHeard(radius) {
+  for (const z of zombies) {
+    if (!z.stats.alive) continue;
+    if (hears(z.root.position.x, z.root.position.z, player.pos.x, player.pos.z, radius)) {
+      z.stats.memValid = true; z.stats.memX = player.pos.x; z.stats.memZ = player.pos.z;
+      if (!z.ai.alerted && !canSee(z.root.position.x, z.root.position.z, z.root.rotation.y, player.pos.x, player.pos.z, sightBoxes)) {
+        z.ai.alerted = true;
+        if (z.ai.state === S.IDLE || z.ai.state === S.WANDER) { z.ai.state = S.INVESTIGATE; z.ai.t = 0; }
+      }
+    }
+  }
+}
+
+let sightBoxes = [];
+function buildSightBoxes() {
+  sightBoxes = mapWorld ? mapWorld.colliders.filter(b => b.kind === 'house') : [];
+}
+
+let attackers = 0;
+function updateZombieAI(z, dt, frame) {
+  const ts = z.ts;
+  const zp = z.root.position;
+  const dx = player.pos.x - zp.x, dz = player.pos.z - zp.z;
+  const dist = Math.hypot(dx, dz);
+  const seen = z.stats.alive && canSee(zp.x, zp.z, z.root.rotation.y, player.pos.x, player.pos.z, sightBoxes, flashlightOn);
+  if (seen) { z.stats.memValid = true; z.stats.memX = player.pos.x; z.stats.memZ = player.pos.z; }
+  if (!z.stats.alive) { aiOnDead(z.ai); return; }
+
+  // claim surround slot when alerted
+  if (z.ai.alerted && z.aiSlot < 0 && dist < 25) {
+    z.aiSlot = claimSlot(aiSlots, z.id, Math.atan2(zp.x - player.pos.x, zp.z - player.pos.z));
+    z.ai.flanking = shouldFlank(z.id) && dist > 8;
+  }
+  if (!z.ai.alerted && z.aiSlot >= 0) { releaseSlot(aiSlots, z.id); z.aiSlot = -1; }
+  const slot = z.aiSlot >= 0 ? slotPos(aiSlots, z.aiSlot, player.pos.x, player.pos.z, 1.6) : { x: 0, z: 0 };
+
+  const flow = flowDist ? flowDir(navGrid, flowDist, zp.x, zp.z) : null;
+  const ctx = {
+    x: zp.x, z: zp.z, px: player.pos.x, pz: player.pos.z,
+    dist, canSee: seen, memValid: z.stats.memValid, memX: z.stats.memX, memZ: z.stats.memZ,
+    flow, attackRange: ts.attackRange, attackCd: ts.attackCd,
+    attackToken: attackers < 3 + Math.floor(wave / 2),
+    isCrawler: z.stats.crawler, knocked: z.a.knockTarget > 0.5,
+    screamer: !!ts.scream, flanking: z.ai.flanking,
+    slotX: slot.x, slotZ: slot.z,
+  };
+  const out = updateAI(z.ai, ctx, dt);
+  if (out.scream) { audio.scream(); alertNearby(zp.x, zp.z, 40); hordeAlert = 2; }
+  if (out.stuck && !seen) { respawnZombie(z); return; }
+
+  // sync visual states
+  if (z.ai.state === S.KNOCKDOWN) { z.knockdown(); aiOnKnock(z.ai); }
+  else if (z.a.knockTarget > 0 && z.ai.state !== S.KNOCKDOWN) z.getUp();
+  if (z.stats.crawler && !z.a.crawl) z.setCrawl(true);
+
+  // spitter ranged behaviour
+  if (ts.ranged && z.ai.state === S.CHASE && dist < ts.keepDist[1] && dist > ts.keepDist[0]) {
+    out.moveX *= 0.3; out.moveZ *= 0.3;
+    z.spitCd = (z.spitCd || 0) - dt;
+    if (z.spitCd <= 0 && seen) { z.spitCd = 3; spitAt(z, player.pos); }
+    // strafe
+    const s = Math.sin(clock.elapsedTime * 1.5 + z.id);
+    out.moveX += -dz / (dist || 1) * s * 0.6; out.moveZ += dx / (dist || 1) * s * 0.6;
+  }
+  // brute charge
+  if (ts.charge && z.ai.state === S.CHASE && dist > 5) out.speed = (out.speed || 1) * 1.8;
+  // runner zigzag when player aims at it
+  if (ts.zigzag && dist < 18) {
+    const camF = new THREE.Vector3(0, 0, -1).applyEuler(camera.rotation);
+    const toZ = new THREE.Vector3(zp.x - camera.position.x, 0, zp.z - camera.position.z).normalize();
+    if (camF.x * toZ.x + camF.z * toZ.z > 0.985) {
+      const s = Math.sin(clock.elapsedTime * 6 + z.id * 2);
+      out.moveX += -dz / (dist || 1) * s; out.moveZ += dx / (dist || 1) * s;
+    }
+  }
+
+  // separation from other zombies
+  let sepX = 0, sepZ = 0;
+  for (const o of zombies) {
+    if (o === z || !o.stats.alive) continue;
+    const ox = zp.x - o.root.position.x, oz = zp.z - o.root.position.z;
+    const d2 = ox * ox + oz * oz;
+    if (d2 < 1.44 && d2 > 0.0001) { const d = Math.sqrt(d2); sepX += ox / d * 0.6; sepZ += oz / d * 0.6; }
+  }
+
+  const spd = (out.speed || 1) * ts.speed * (z.stats.slowed || 1) * (z.stats.armWeakened ? 1 : 1);
+  z.stats.slowed = Math.min(1, (z.stats.slowed || 1) + dt * 0.1);
+  let mx = out.moveX + sepX, mz = out.moveZ + sepZ;
+  const ml = Math.hypot(mx, mz);
+  if (ml > 1) { mx /= ml; mz /= ml; }
+  const moving = ml > 0.05 && z.ai.state !== S.KNOCKDOWN && z.ai.state !== S.ATTACK;
+  if (moving) {
+    const nx = zp.x + mx * spd * dt, nz = zp.z + mz * spd * dt;
+    const cr = collideCircle(nx, nz, 0.4, [...mapWorld.colliders, ...mapWorld.fenceColliders]);
+    // bash fences
+    for (const fc of mapWorld.fenceColliders) {
+      if (circleHitsBoxLocal(cr.x, cr.z, 0.45, fc)) {
+        fc.fence.hp -= spd * dt * 40;
+        fx.burst(new THREE.Vector3(fc.x, 0.8, fc.z), 'wood', new THREE.Vector3(0, 0.5, 0));
+        if (fc.fence.hp <= 0) { mapWorld.removeFence(fc.fence); rebuildWorldRay(); audio.woodBreak(); }
+        break;
+      }
+    }
+    z.root.position.set(cr.x, 0, cr.z);
+    const faceYaw = Math.atan2(mx, mz);
+    let dy = faceYaw - z.root.rotation.y;
+    while (dy > Math.PI) dy -= Math.PI * 2; while (dy < -Math.PI) dy += Math.PI * 2;
+    z.root.rotation.y += dy * Math.min(1, dt * 5);
+  }
+  z.setMove(moving ? Math.min(1, spd) : 0);
+
+  // attack lands at swipe hit moment
+  if (out.wantAttack) z.startAttack();
+  if (z.attackHitPending && dist < ts.attackRange * 1.3) {
+    z.attackHitPending = false;
+    if (ts.explode) { bloaterExplode(z); }
+    else damagePlayer(ts.dmg * (z.stats.armWeakened ? 0.6 : 1), zp);
+    if (ts.knockback) {
+      const kb = new THREE.Vector3(player.pos.x - zp.x, 0, player.pos.z - zp.z).normalize().multiplyScalar(ts.knockback * 0.12);
+      player.pos.x += kb.x; player.pos.z += kb.z;
+      player.shake = 1.5;
+    }
+  }
+  if (z.ai.state === S.ATTACK) attackers++;
+  if (z.a.flinchT >= 0) aiOnHit(z.ai);
+}
+
+function circleHitsBoxLocal(x, z, r, b) {
+  const qx = Math.max(-b.hw, Math.min(b.hw, x - b.x));
+  const qz = Math.max(-b.hd, Math.min(b.hd, z - b.z));
+  return (x - b.x - qx) ** 2 + (z - b.z - qz) ** 2 < r * r;
+}
+
+function respawnZombie(z) {
+  z.ai.stuckT = 0;
+  const sp = map.spawns[Math.floor(Math.random() * map.spawns.length)];
+  const [fx2, fz2] = nearestFree(navGrid, sp.x, sp.z);
+  z.root.position.set(fx2, 0, fz2);
+}
+
+function spitAt(z, target) {
+  const g = new THREE.Mesh(new THREE.SphereGeometry(0.16, 8, 6),
+    new THREE.MeshStandardMaterial({ color: 0x54d13a, emissive: 0x1a5510 }));
+  g.position.copy(z.root.position).setY(1.4);
+  const v = new THREE.Vector3(target.x - z.root.position.x, 0, target.z - z.root.position.z);
+  const t = v.length() / 8;
+  v.normalize().multiplyScalar(v.length() / Math.max(0.4, t));
+  v.y = 4.5;
+  scene.add(g);
+  projectiles.push({ m: g, vel: v, life: 4, kind: 'goo' });
+  audio.spit();
+}
+
+function bloaterExplode(z) {
+  const p = z.root.position.clone();
+  fx.burst(p.clone().setY(1), 'goo', new THREE.Vector3(0, 1, 0));
+  fx.burst(p.clone().setY(1), 'goo', new THREE.Vector3(0, 1, 0));
+  const ring = new THREE.Mesh(new THREE.RingGeometry(0.5, 1, 24),
+    new THREE.MeshBasicMaterial({ color: 0x8aff5a, transparent: true, opacity: 0.9, side: THREE.DoubleSide, blending: THREE.AdditiveBlending }));
+  ring.rotation.x = -Math.PI / 2; ring.position.copy(p).setY(0.1);
+  scene.add(ring); shockwaves.push({ m: ring, life: 0.5 });
+  audio.explosion();
+  const d = Math.hypot(player.pos.x - p.x, player.pos.z - p.z);
+  if (d < 5) damagePlayer(40 * (1 - d / 5), p);
+  for (const o of zombies) {
+    if (o === z || !o.stats.alive) continue;
+    const od = Math.hypot(o.root.position.x - p.x, o.root.position.z - p.z);
+    if (od < 5) { o.stats.hp -= 80; o.flinch('body', 1); if (o.stats.hp <= 0) { o.stats.alive = false; o.die(Math.atan2(o.root.position.x - p.x, o.root.position.z - p.z)); } }
+  }
+  z.stats.alive = false;
+  z.die(Math.random() * Math.PI * 2);
+  z.root.visible = false;
+}
+const shockwaves = [];
+
+function damagePlayer(dmg, fromPos) {
+  player.health = Math.max(0, player.health - dmg);
+  audio.hurt();
+  const v = document.getElementById('vignette');
+  v.style.opacity = Math.min(0.9, dmg / 25);
+  dmgVig = 0.6;
+  if (fromPos) {
+    const ang = Math.atan2(fromPos.x - player.pos.x, fromPos.z - player.pos.z) - player.yaw;
+    const arr = document.getElementById('dmgArrow');
+    arr.style.opacity = 1;
+    arr.querySelector('.arr').style.transform = `rotate(${-ang}rad)`;
+    dmgArrowT = 0.8;
+  }
+  if (player.health <= 0) gameOver();
+}
+let dmgVig = 0, dmgArrowT = 0;
+function gameOver() {
+  document.getElementById('gameover').classList.add('on');
+  document.exitPointerLock?.();
 }
 
 // ---------- view model ----------
@@ -218,6 +454,7 @@ function tryReload() {
 const raycaster = new THREE.Raycaster();
 const tmpV = new THREE.Vector3();
 let hitstop = 0, slowmo = 1;
+let flashlightOn = false, wave = 1;
 let kills = 0, score = 0, combo = 0, comboTimer = 0, streakCount = 0, streakTimer = 0;
 let lastKillTime = -10;
 const dmgNums = [];
@@ -244,6 +481,7 @@ function fire() {
   player.shake = Math.max(player.shake, w.shake);
   vm.kick = w.kick; vm.kickRot = w.kick * 0.6;
   audio.shot(curWeapon);
+  noiseHeard(w.noise);
   if (a.clip === 0) audio.dry();
 
   const origin = camera.position.clone();
@@ -321,6 +559,8 @@ function hitZombie(zom, zone, dir, w) {
 }
 
 function onZombieDeath(zom, zone, dir) {
+  aiOnDead(zom.ai);
+  releaseSlot(aiSlots, zom.id);
   kills++;
   combo++; comboTimer = 3; streakCount++; streakTimer = 1.2;
   score += scoreForKill(WEAPONS[curWeapon], zone, combo);
@@ -415,6 +655,12 @@ const audio = {
   hit() { this.blip(500, 0.05, 'triangle', 0.06); },
   kill() { this.blip(300, 0.12, 'triangle', 0.07); },
   reload() { this.blip(400, 0.06, 'square', 0.05); },
+  scream() { this.blip(1400, 0.5, 'sawtooth', 0.1); },
+  spit() { this.blip(200, 0.2, 'sine', 0.06); },
+  explosion() { this.blip(60, 0.5, 'sawtooth', 0.2); },
+  hurt() { this.blip(150, 0.2, 'triangle', 0.1); },
+  woodBreak() { this.blip(120, 0.15, 'square', 0.08); },
+  groan() { this.blip(80 + Math.random() * 40, 0.6, 'sine', 0.04); },
 };
 
 // ---------- input / player ----------
@@ -464,6 +710,37 @@ function updatePlayer(dt) {
   return playerMoving;
 }
 
+// ---------- debug AI overlay ----------
+const dbgLabels = [];
+let flowArrows = null;
+function updateDebugAI() {
+  let i = 0;
+  for (const z of zombies) {
+    if (!z.stats.alive) continue;
+    let d = dbgLabels[i];
+    if (!d) { d = document.createElement('div'); d.style.cssText = 'position:absolute;color:#0f0;font:11px monospace;text-shadow:0 0 3px #000;pointer-events:none;'; document.body.appendChild(d); dbgLabels[i] = d; }
+    d.style.display = 'block';
+    d.textContent = z.ai.state + (z.ai.alerted ? '!' : '');
+    const v = z.root.position.clone().setY(2.1).project(camera);
+    d.style.left = ((v.x * 0.5 + 0.5) * innerWidth) + 'px';
+    d.style.top = ((-v.y * 0.5 + 0.5) * innerHeight) + 'px';
+    i++;
+  }
+  for (; i < dbgLabels.length; i++) dbgLabels[i].style.display = 'none';
+  if (VIEW === 'map' && flowDist && !flowArrows) {
+    const pts = [];
+    for (let gz = 0; gz < navGrid.h; gz += 5) for (let gx = 0; gx < navGrid.w; gx += 5) {
+      const x = navGrid.ox + (gx + 0.5) * navGrid.cell, z = navGrid.oz + (gz + 0.5) * navGrid.cell;
+      const fd = flowDir(navGrid, flowDist, x, z);
+      if (fd) { pts.push(x, 0.5, z, x + fd.x * 1.6, 0.5, z + fd.z * 1.6); }
+    }
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.Float32BufferAttribute(pts, 3));
+    flowArrows = new THREE.LineSegments(g, new THREE.LineBasicMaterial({ color: 0x00ff88 }));
+    scene.add(flowArrows);
+  }
+}
+
 // ---------- demo ----------
 let demoMode = DEMO;
 if (DEMO) document.getElementById('startScreen').classList.remove('on');
@@ -486,7 +763,13 @@ async function init() {
   }
 
   const zbase = VIEW === 'zombies' ? -2.6 : -4;
-  if (ANIM) {
+  if (params.get('types') === '1') {
+    const list = ['walker', 'runner', 'crawler', 'brute', 'screamer', 'spitter', 'bloater'];
+    list.forEach((t, i) => {
+      const z = spawnZombie((i - 3) * 1.7, -4.5, i % 2 ? skinA : skinC, { type: t });
+      z.root.rotation.y = Math.PI; z.setMove(0.6);
+    });
+  } else if (ANIM) {
     for (let i = 0; i < 5; i++) {
       const z = spawnZombie((i - 2) * 1.3, zbase, i % 2 ? skinA : skinC);
       z.root.rotation.y = Math.PI;
@@ -580,7 +863,14 @@ function loop() {
     const f = Math.sin(t * 13 + l.userData.flicker) > -0.92 ? 1 : 0.3;
     l.children[2].intensity = 30 * f;
   }
+  attackers = 0;
+  flowTimer -= dt;
+  if (flowTimer <= 0) { rebuildFlow(); flowTimer = 0.5; }
+  let frame = (frameNo = (frameNo + 1) % 2);
   for (const z of zombies) {
+    if (z.stats.alive && VIEW !== 'map' && !ANIM && (z.root.position.distanceTo(camera.position) < 45 || frame === z.id % 2)) {
+      updateZombieAI(z, dt, frame);
+    }
     if (z.kb > 0) {
       const d = new THREE.Vector3(Math.sin(z.kbDir), 0, Math.cos(z.kbDir));
       const nx = z.root.position.x + d.x * z.kb * dt * 2, nz = z.root.position.z + d.z * z.kb * dt * 2;
@@ -592,6 +882,36 @@ function loop() {
   }
   fx.update(dt);
   scene.__camMat = camera.matrixWorld;
+  // projectiles
+  for (let i = projectiles.length - 1; i >= 0; i--) {
+    const pr = projectiles[i];
+    pr.life -= dt; pr.vel.y -= 9.8 * dt;
+    pr.m.position.addScaledVector(pr.vel, dt);
+    if (pr.m.position.y < 0.1 || pr.life <= 0) {
+      scene.remove(pr.m); projectiles.splice(i, 1);
+      const pp = pr.m.position.clone(); pp.y = 0.03;
+      const puddle = new THREE.Mesh(new THREE.CircleGeometry(1.4, 16),
+        new THREE.MeshBasicMaterial({ color: 0x3fae2a, transparent: true, opacity: 0.75 }));
+      puddle.rotation.x = -Math.PI / 2; puddle.position.copy(pp);
+      scene.add(puddle); puddles.push({ m: puddle, life: 6 });
+      fx.burst(pp, 'goo', new THREE.Vector3(0, 1, 0));
+    }
+  }
+  for (let i = puddles.length - 1; i >= 0; i--) {
+    const pd = puddles[i]; pd.life -= dt;
+    pd.m.material.opacity = Math.min(0.75, pd.life / 6);
+    if (Math.hypot(player.pos.x - pd.m.position.x, player.pos.z - pd.m.position.z) < 1.3) damagePlayer(8 * dt, pd.m.position);
+    if (pd.life <= 0) { scene.remove(pd.m); puddles.splice(i, 1); }
+  }
+  for (let i = shockwaves.length - 1; i >= 0; i--) {
+    const sw = shockwaves[i]; sw.life -= dt;
+    sw.m.scale.setScalar(1 + (0.5 - sw.life) * 14);
+    sw.m.material.opacity = Math.max(0, sw.life * 1.8);
+    if (sw.life <= 0) { scene.remove(sw.m); shockwaves.splice(i, 1); }
+  }
+  if (dmgVig > 0) { dmgVig -= dt; $('vignette').style.opacity = Math.max(0, dmgVig); }
+  if (dmgArrowT > 0) { dmgArrowT -= dt; if (dmgArrowT <= 0) $('dmgArrow').style.opacity = 0; }
+  if (DEBUG_AI) updateDebugAI();
 
   // HUD timers
   if (hmTimer > 0) { hmTimer -= dt; if (hmTimer <= 0) $('hitmarker').style.opacity = 0; }
@@ -617,7 +937,7 @@ function loop() {
   renderer.clearDepth();
   renderer.render(viewScene, viewCamera);
 }
-let firedOnce = false, lastFireHeld = false, lastDemoShot = 0;
+let firedOnce = false, lastFireHeld = false, lastDemoShot = 0, frameNo = 0;
 function demoFire() {
   const zom = zombies.find(z => z.stats.alive);
   if (!zom) return;
