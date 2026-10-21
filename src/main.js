@@ -279,6 +279,24 @@ function updateZombieAI(z, dt, frame) {
   if (z.a.flinchT >= 0) aiOnHit(z.ai);
 }
 
+let crateProto = null;
+function placeCrates() {
+  if (!crateProto) return;
+  const spots = [[-6, -20], [10, 16], [-30, 6], [34, -30], [-16, 40], [40, 22]];
+  for (const [x, z] of spots) {
+    const c = crateProto.clone(true);
+    c.traverse(o => { if (o.isMesh) { o.material = o.material.clone(); o.material.color.set(0xcc2222); o.material.emissive = new THREE.Color(0x440000); } });
+    const [fx2, fz2] = nearestFree(navGrid, x, z);
+    c.position.set(fx2, 0, fz2);
+    scene.add(c);
+    const box = new THREE.Mesh(rayBoxGeo, rayBoxMat);
+    box.position.set(fx2, 0.6, fz2); box.scale.set(1.2, 1.2, 1.2); box.visible = false;
+    box.userData.crate = { mesh: c, x: fx2, z: fz2 };
+    worldRayGroup.add(box); worldRayboxes.push(box);
+    crates.push(box);
+  }
+}
+
 function circleHitsBoxLocal(x, z, r, b) {
   const qx = Math.max(-b.hw, Math.min(b.hw, x - b.x));
   const qz = Math.max(-b.hd, Math.min(b.hd, z - b.z));
@@ -328,6 +346,7 @@ function bloaterExplode(z) {
 const shockwaves = [];
 
 function damagePlayer(dmg, fromPos) {
+  if (gameState !== 'playing') return;
   player.health = Math.max(0, player.health - dmg);
   audio.hurt();
   const v = document.getElementById('vignette');
@@ -344,6 +363,9 @@ function damagePlayer(dmg, fromPos) {
 }
 let dmgVig = 0, dmgArrowT = 0;
 function gameOver() {
+  gameState = 'over';
+  if (score > highScore) { highScore = score; localStorage.setItem('ds-highscore', highScore); }
+  $('goStats').innerHTML = `Score: <b>${score}</b><br>Wave: <b>${wave}</b> &nbsp; Kills: <b>${kills}</b><br>High score: <b>${highScore}</b>`;
   document.getElementById('gameover').classList.add('on');
   document.exitPointerLock?.();
 }
@@ -432,6 +454,10 @@ let curWeapon = 'rifle';
 function curWeaponIdx() { return WEAPON_ORDER.indexOf(curWeapon); }
 function onKey(code) {
   if (code === 'KeyR') tryReload();
+  if (code === 'KeyG' && gameState === 'playing') armGrenade();
+  if (code === 'KeyV' && gameState === 'playing') melee();
+  if (code === 'KeyF') { flashlightOn = !flashlightOn; if (flashSpot) flashSpot.visible = flashlightOn; }
+  if (code === 'KeyM') { audio.muted = !audio.muted; $('muteTag').style.display = audio.muted ? 'block' : 'none'; }
   const n = { Digit1: 0, Digit2: 1, Digit3: 2, Digit4: 3 }[code];
   if (n !== undefined) switchWeapon(WEAPON_ORDER[n]);
 }
@@ -481,7 +507,7 @@ function fire() {
   player.shake = Math.max(player.shake, w.shake);
   vm.kick = w.kick; vm.kickRot = w.kick * 0.6;
   audio.shot(curWeapon);
-  noiseHeard(w.noise);
+  noiseHeard(w.noise * (silencer ? 0.4 : 1));
   if (a.clip === 0) audio.dry();
 
   const origin = camera.position.clone();
@@ -516,6 +542,15 @@ function fire() {
       } else {
         end = h.point.clone();
         const n = h.face ? h.face.normal.clone().transformDirection(h.object.matrixWorld) : new THREE.Vector3(0, 1, 0);
+        if (h.object.userData.crate) {
+          const cr = h.object.userData.crate;
+          worldRayGroup.remove(h.object);
+          worldRayboxes.splice(worldRayboxes.indexOf(h.object), 1);
+          scene.remove(cr.mesh);
+          crates.splice(crates.indexOf(h.object), 1);
+          grenadeExplode(new THREE.Vector3(cr.x, 0.6, cr.z));
+          break;
+        }
         const surf = surfaceOf(h.object);
         fx.burst(h.point, surf, n.clone().negate());
         if (surf !== 'spark') fx.decal(h.point, n);
@@ -573,6 +608,8 @@ function onZombieDeath(zom, zone, dir) {
   }
   if (streakCount >= 2 && streakTimer > 0) showStreak(streakCount);
   audio.kill();
+  directorNoteKill(director, clock.elapsedTime);
+  if (Math.random() < 0.12) spawnPickup(zom.root.position.x, zom.root.position.z, ['ammo', 'health', 'grenade'][Math.floor(Math.random() * 3)]);
   updateHudTop();
 }
 
@@ -644,7 +681,7 @@ const audio = {
     if (this.muted) return;
     try {
       const c = this.ensure(); const o = c.createOscillator(); const g = c.createGain();
-      o.type = type; o.frequency.value = freq; g.gain.value = vol;
+      o.type = type; o.frequency.value = freq; g.gain.value = vol * this.vol;
       g.gain.exponentialRampToValueAtTime(0.001, c.currentTime + dur);
       o.connect(g).connect(c.destination); o.start(); o.stop(c.currentTime + dur);
     } catch (e) {}
@@ -661,13 +698,16 @@ const audio = {
   hurt() { this.blip(150, 0.2, 'triangle', 0.1); },
   woodBreak() { this.blip(120, 0.15, 'square', 0.08); },
   groan() { this.blip(80 + Math.random() * 40, 0.6, 'sine', 0.04); },
+  melee() { this.blip(250, 0.08, 'triangle', 0.07); },
+  pickup() { this.blip(880, 0.12, 'sine', 0.07); },
+  vol: 0.8,
 };
 
 // ---------- input / player ----------
 let playerMoving = false;
 function collidersNow() { return mapWorld ? [...mapWorld.colliders, ...mapWorld.fenceColliders] : []; }
 function updatePlayer(dt) {
-  const sens = 0.0022;
+  const sens = 0.0022 * sensMul;
   player.yaw -= mouseDX * sens; player.pitch -= mouseDY * sens;
   player.pitch = Math.max(-1.5, Math.min(1.5, player.pitch));
   vm.swayX += (-mouseDX * 0.0015 - vm.swayX) * Math.min(1, dt * 8);
@@ -741,12 +781,267 @@ function updateDebugAI() {
   }
 }
 
+// ---------- game flow ----------
+import { createDirector, directorUpdate, directorNoteKill, waveComposition, shouldDropSupply, breakDuration, directorWantsHorde } from './logic/director.js';
+import { SHOP, canBuy, applyPurchase } from './logic/economy.js';
+
+let gameState = 'menu'; // menu, playing, paused, buy, over
+const director = createDirector();
+let waveActive = false, breakT = 0, aliveInWave = 0, lastSlowmoWave = -1;
+let grenades = 2, silencer = false;
+const pickups = [];
+const crates = [];
+let grenadeArmed = false, grenadePreview = null, armedT = 0;
+let flashlightOn2 = false;
+let highScore = +(localStorage.getItem('ds-highscore') || 0);
+
+function startGame() {
+  $('startScreen').classList.remove('on');
+  $('hud').classList.add('on');
+  gameState = 'playing';
+  canvas.requestPointerLock?.();
+  startWave(1);
+}
+function startWave(n) {
+  wave = n;
+  $('waveVal').textContent = n;
+  const comp = waveComposition(n);
+  let toSpawn = [];
+  for (const [t, c] of Object.entries(comp)) { if (t !== 'horde') for (let i = 0; i < c; i++) toSpawn.push(t); }
+  if (directorWantsHorde(n)) showBanner('THE HORDE COMES');
+  else showBanner('WAVE ' + n);
+  for (const t of toSpawn) {
+    const sp = pickSpawn();
+    const z = spawnZombie(sp.x, sp.z, Math.random() < 0.5 ? skinA : skinC, { type: t });
+    z.ai.alerted = true; z.ai.state = S.CHASE;
+  }
+  waveActive = true;
+}
+function pickSpawn() {
+  let best = null, bestD = -1;
+  for (let i = 0; i < 6; i++) {
+    const s = map.spawns[Math.floor(Math.random() * map.spawns.length)];
+    const d = Math.hypot(s.x - player.pos.x, s.z - player.pos.z);
+    if (d > bestD) { bestD = d; best = s; }
+  }
+  const [fx2, fz2] = nearestFree(navGrid, best.x, best.z);
+  return { x: fx2, z: fz2 };
+}
+function showBanner(txt) {
+  const b = $('waveBanner');
+  b.textContent = txt; b.style.opacity = 1;
+  clearTimeout(b._t);
+  b._t = setTimeout(() => { b.style.opacity = 0; }, 2500);
+}
+let bannerT = 0;
+
+function checkWaveEnd(dt) {
+  if (!waveActive || gameState !== 'playing') return;
+  const alive = zombies.filter(z => z.stats.alive).length;
+  if (alive === 0) {
+    waveActive = false;
+    if (wave !== lastSlowmoWave) { lastSlowmoWave = wave; slowmo = 0.35; setTimeout(() => slowmo = 1, 900); }
+    breakT = breakDuration(wave);
+    openBuy();
+  }
+  // slow-mo when last zombie of wave
+}
+
+function openBuy() {
+  gameState = 'buy';
+  document.exitPointerLock?.();
+  breakT = breakDuration(wave);
+  $('buyMenu').classList.add('on');
+  buildBuyGrid();
+}
+function buildBuyGrid() {
+  $('buyCash').textContent = score;
+  const g = $('buyGrid'); g.innerHTML = '';
+  const state = { owned: { smg: ammoStates.smg.owned, shotgun: ammoStates.shotgun.owned, rifle: ammoStates.rifle.owned }, silencer, health: player.health, grenades };
+  for (const item of SHOP) {
+    const d = document.createElement('div');
+    d.className = 'buyItem';
+    d.innerHTML = `<div class="bi-name">${item.name}</div><div style="font-size:11px;color:#8aa">${item.desc}</div><div class="bi-cost">${item.cost} pts</div>`;
+    d.onclick = () => {
+      if (!canBuy(item, score, state)) return;
+      score -= item.cost;
+      applyPurchase(item, state);
+      if (item.id === 'ammo') { const a = ammoStates[curWeapon]; a.reserve = WEAPONS[curWeapon].reserveMax; updateHudAmmo(); }
+      if (item.id === 'smg') ammoStates.smg.owned = true;
+      if (item.id === 'shotgun') ammoStates.shotgun.owned = true;
+      if (item.id === 'rifle') ammoStates.rifle.owned = true;
+      if (item.id === 'silencer') silencer = true;
+      if (item.id === 'grenade') grenades = state.grenades;
+      player.health = state.health;
+      updateHudTop(); buildBuyGrid();
+    };
+    g.appendChild(d);
+  }
+}
+$('btnBuyClose').onclick = () => {
+  $('buyMenu').classList.remove('on');
+  gameState = 'playing';
+  canvas.requestPointerLock?.();
+};
+$('btnStart').onclick = startGame;
+$('btnResume').onclick = () => { $('pauseScreen').classList.remove('on'); gameState = 'playing'; canvas.requestPointerLock?.(); };
+$('btnQuit').onclick = () => location.reload();
+$('btnRetry').onclick = () => location.reload();
+$('btnPauseShow').onclick = () => $('pauseScreen').classList.add('on');
+document.addEventListener('pointerlockchange', () => {
+  if (!document.pointerLockElement && gameState === 'playing') {
+    gameState = 'paused';
+    $('pauseScreen').classList.add('on');
+  }
+});
+$('sensSlider').oninput = e => { sensMul = e.target.value / 100; };
+$('volSlider').oninput = e => { audio.vol = e.target.value / 100; };
+let sensMul = 1;
+
+// ---------- grenades / melee / flashlight ----------
+function throwGrenade() {
+  if (grenades <= 0) return;
+  grenades--;
+  const g = grenadeMeshProto.clone();
+  g.position.copy(camera.position).add(new THREE.Vector3(0.2, -0.15, -0.4).applyEuler(camera.rotation));
+  const v = new THREE.Vector3(0, 0, 1).applyEuler(camera.rotation).multiplyScalar(11);
+  v.y += 2.5;
+  scene.add(g);
+  grenadesFly.push({ m: g, vel: v, fuse: 2 });
+  grenadeArmed = false;
+  if (grenadePreview) { scene.remove(grenadePreview); grenadePreview = null; }
+}
+const grenadesFly = [];
+let grenadeMeshProto = null, flashSpot = null;
+function armGrenade() {
+  if (grenades <= 0 || grenadeArmed) return;
+  grenadeArmed = true; armedT = 0;
+  const pts = [];
+  for (let i = 0; i <= 20; i++) pts.push(new THREE.Vector3());
+  grenadePreview = new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts),
+    new THREE.LineBasicMaterial({ color: 0xffaa44, transparent: true, opacity: 0.8 }));
+  scene.add(grenadePreview);
+}
+function updateGrenadePreview(dt) {
+  if (!grenadeArmed) return;
+  armedT += dt;
+  const v = new THREE.Vector3(0, 0, 1).applyEuler(camera.rotation).multiplyScalar(11); v.y += 2.5;
+  const p = camera.position.clone().add(new THREE.Vector3(0.2, -0.15, -0.4).applyEuler(camera.rotation));
+  const pos = grenadePreview.geometry.attributes.position;
+  for (let i = 0; i <= 20; i++) {
+    const t = i / 20 * 1.2;
+    pos.setXYZ(i, p.x + v.x * t, Math.max(0.05, p.y + v.y * t - 4.9 * t * t), p.z + v.z * t);
+  }
+  pos.needsUpdate = true;
+  if (armedT > 2.2) throwGrenade();
+}
+function grenadeExplode(pos) {
+  const ring = new THREE.Mesh(new THREE.RingGeometry(0.5, 1.2, 28),
+    new THREE.MeshBasicMaterial({ color: 0xffcc66, transparent: true, opacity: 1, side: THREE.DoubleSide, blending: THREE.AdditiveBlending }));
+  ring.rotation.x = -Math.PI / 2; ring.position.copy(pos).setY(0.1);
+  scene.add(ring); shockwaves.push({ m: ring, life: 0.6 });
+  const fl = new THREE.PointLight(0xffeecc, 300, 30); fl.position.copy(pos).setY(1.5); scene.add(fl);
+  setTimeout(() => scene.remove(fl), 90);
+  audio.explosion();
+  player.shake = 2;
+  for (let i = 0; i < 20; i++) fx.burst(pos, 'spark', new THREE.Vector3(Math.random() - 0.5, 1, Math.random() - 0.5));
+  for (const z of zombies) {
+    if (!z.stats.alive) continue;
+    const d = z.root.position.distanceTo(pos);
+    if (d < 6) {
+      z.stats.hp -= 160 * (1 - d / 6);
+      if (z.stats.hp <= 0) { z.stats.alive = false; onZombieDeath(z, 'body', new THREE.Vector3(z.root.position.x - pos.x, 0, z.root.position.z - pos.z)); }
+      else { z.knockdown(); }
+    }
+  }
+  const pd = Math.hypot(player.pos.x - pos.x, player.pos.z - pos.z);
+  if (pd < 4) damagePlayer(20 * (1 - pd / 4), pos);
+}
+function melee() {
+  audio.melee();
+  const f = new THREE.Vector3(0, 0, -1).applyEuler(camera.rotation);
+  for (const z of zombies) {
+    if (!z.stats.alive) continue;
+    const dx = z.root.position.x - player.pos.x, dz = z.root.position.z - player.pos.z;
+    const d = Math.hypot(dx, dz);
+    if (d < 2.6 && (dx * -f.x + dz * -f.z) / (d || 1) > 0.4) {
+      z.kb = 8; z.kbDir = Math.atan2(dx, dz);
+      z.stagger(); z.interruptAttack();
+      z.stats.hp -= 20;
+      if (z.stats.hp <= 0) { z.stats.alive = false; onZombieDeath(z, 'body', new THREE.Vector3(dx, 0, dz)); }
+    }
+  }
+  vm.kick = 1.2; vm.kickRot = 0.8;
+}
+
+// ---------- pickups ----------
+function spawnPickup(x, z, kind) {
+  const colors = { ammo: 0xffd24a, health: 0x44ff66, grenade: 0xff8844 };
+  const m = new THREE.Mesh(new THREE.OctahedronGeometry(0.22),
+    new THREE.MeshStandardMaterial({ color: colors[kind], emissive: colors[kind], emissiveIntensity: 0.7 }));
+  m.position.set(x, 0.6, z);
+  scene.add(m);
+  pickups.push({ m, kind, life: 30 });
+}
+function updatePickups(dt) {
+  for (let i = pickups.length - 1; i >= 0; i--) {
+    const p = pickups[i];
+    p.life -= dt;
+    p.m.rotation.y += dt * 2.5;
+    p.m.position.y = 0.6 + Math.sin(clock.elapsedTime * 3 + i) * 0.08;
+    if (Math.hypot(p.m.position.x - player.pos.x, p.m.position.z - player.pos.z) < 1.2) {
+      if (p.kind === 'ammo') { const a = ammoStates[curWeapon]; a.reserve = Math.min(WEAPONS[curWeapon].reserveMax, a.reserve + WEAPONS[curWeapon].clip * 2); updateHudAmmo(); }
+      if (p.kind === 'health') player.health = Math.min(100, player.health + 30);
+      if (p.kind === 'grenade') grenades++;
+      audio.pickup();
+      scene.remove(p.m); pickups.splice(i, 1); continue;
+    }
+    if (p.life <= 0) { scene.remove(p.m); pickups.splice(i, 1); }
+  }
+}
+
+// ---------- minimap ----------
+const mmCtx = $('minimap').getContext('2d');
+let mmT = 0;
+function drawMinimap() {
+  const c = mmCtx, S2 = 170 / 120;
+  c.clearRect(0, 0, 170, 170);
+  c.fillStyle = 'rgba(0,0,10,0.4)'; c.fillRect(0, 0, 170, 170);
+  c.fillStyle = 'rgba(120,130,160,0.5)';
+  for (const b of map.boxes) {
+    if (b.kind !== 'house') continue;
+    c.fillRect((b.x + 60 - b.hw) * S2, (b.z + 60 - b.hd) * S2, b.hw * 2 * S2, b.hd * 2 * S2);
+  }
+  for (const z of zombies) {
+    if (!z.stats.alive) continue;
+    const t = z.type || 'walker';
+    c.fillStyle = '#' + new THREE.Color(TYPES[t].tint).getHexString();
+    c.beginPath();
+    c.arc((z.root.position.x + 60) * S2, (z.root.position.z + 60) * S2, 2.5, 0, 7);
+    c.fill();
+  }
+  c.save();
+  c.translate((player.pos.x + 60) * S2, (player.pos.z + 60) * S2);
+  c.rotate(-player.yaw);
+  c.fillStyle = '#fff';
+  c.beginPath(); c.moveTo(0, -5); c.lineTo(3.5, 4); c.lineTo(-3.5, 4); c.fill();
+  c.restore();
+}
+
 // ---------- demo ----------
 let demoMode = DEMO;
-if (DEMO) document.getElementById('startScreen').classList.remove('on');
+if (DEMO) { document.getElementById('startScreen').classList.remove('on'); gameState = 'demo'; }
 
 async function init() {
-  const { guns, clip, foam } = await loadAssets();
+  const { guns, clip, foam, crate } = await loadAssets();
+  grenadeMeshProto = foam;
+  flashSpot = new THREE.SpotLight(0xfff2cc, 120, 34, 0.42, 0.35, 1.6);
+  flashSpot.visible = false;
+  flashSpot.castShadow = false;
+  camera.add(flashSpot);
+  const tget = new THREE.Object3D(); tget.position.set(0, 0, -1); camera.add(tget);
+  flashSpot.target = tget;
+  crateProto = crate;
   setupViewModel(guns, clip);
   if (VIEW === 'map') {
     scene.fog = null; moon.intensity = 3.5; fill.intensity = 2.5;
@@ -790,6 +1085,9 @@ async function init() {
     // keep zombies alive for continuous target practice
     for (const z of zombies) { z.stats.alive = true; z.a.death = null; }
   }
+  placeCrates();
+  if (params.has('wave')) setTimeout(() => { gameState = 'playing'; startWave(1); }, 300);
+  if (params.has('buy')) setTimeout(() => { score = 1200; gameState = 'buy'; openBuy(); }, 300);
   console.log('[main] ready'); window.__gameReady = true;
 }
 init().catch(e => console.error('[init failed]', e && e.stack || e));
@@ -912,6 +1210,46 @@ function loop() {
   if (dmgVig > 0) { dmgVig -= dt; $('vignette').style.opacity = Math.max(0, dmgVig); }
   if (dmgArrowT > 0) { dmgArrowT -= dt; if (dmgArrowT <= 0) $('dmgArrow').style.opacity = 0; }
   if (DEBUG_AI) updateDebugAI();
+  updateGrenadePreview(dt);
+  for (let i = grenadesFly.length - 1; i >= 0; i--) {
+    const gr = grenadesFly[i];
+    gr.fuse -= dt; gr.vel.y -= 14 * dt;
+    gr.m.position.addScaledVector(gr.vel, dt);
+    if (gr.m.position.y < 0.12) { gr.m.position.y = 0.12; gr.vel.y *= -0.4; gr.vel.x *= 0.7; gr.vel.z *= 0.7; }
+    if (gr.fuse <= 0) { grenadeExplode(gr.m.position.clone()); scene.remove(gr.m); grenadesFly.splice(i, 1); }
+  }
+  updatePickups(dt);
+  if (bannerT > 0) { bannerT -= dt; if (bannerT <= 0) $('waveBanner').style.opacity = 0; }
+  if (gameState === 'playing') {
+    directorUpdate(director, dt, { health: player.health, ammoFrac: ammoStates[curWeapon].reserve / WEAPONS[curWeapon].reserveMax, px: player.pos.x, pz: player.pos.z, time: t });
+    checkWaveEnd(dt);
+    if (shouldDropSupply(director) && Math.random() < dt * 0.05) {
+      const sp = pickSpawn();
+      spawnPickup(sp.x, sp.z, player.health < 40 ? 'health' : 'ammo');
+    }
+    if (director.pendingSpecials > 0 && Math.random() < dt * 0.3) {
+      director.pendingSpecials--;
+      const sp = pickSpawn();
+      const z = spawnZombie(sp.x, sp.z, skinC, { type: ['screamer', 'brute', 'spitter'][Math.floor(Math.random() * 3)] });
+      z.ai.alerted = true; z.ai.state = S.CHASE;
+    }
+    // slow-mo when exactly one zombie left in wave
+    const aliveN = zombies.reduce((a, z) => a + (z.stats.alive ? 1 : 0), 0);
+    if (waveActive && aliveN === 1 && slowmo === 1) slowmo = 0.4;
+    else if (aliveN !== 1 && slowmo === 0.4) slowmo = 1;
+  }
+  if (gameState === 'buy') {
+    breakT -= dt;
+    $('buyTimer').textContent = Math.ceil(breakT);
+    if (breakT <= 0) { $('buyMenu').classList.remove('on'); gameState = 'playing'; canvas.requestPointerLock?.(); startWave(wave + 1); }
+  }
+  mmT -= dt; if (mmT <= 0 && gameState !== 'menu') { drawMinimap(); mmT = 0.15; }
+  // ambient groans near zombies
+  if (Math.random() < dt * 0.4) {
+    let near = null, nd = 1e9;
+    for (const z of zombies) { if (!z.stats.alive) continue; const d = z.root.position.distanceTo(camera.position); if (d < nd) { nd = d; near = z; } }
+    if (near && nd < 20) audio.groan();
+  }
 
   // HUD timers
   if (hmTimer > 0) { hmTimer -= dt; if (hmTimer <= 0) $('hitmarker').style.opacity = 0; }
