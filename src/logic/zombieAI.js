@@ -33,7 +33,7 @@ export function updateAI(ai, ctx, dt, rnd = Math.random) {
   if (ctx.isCrawler && ai.state !== S.CRAWL && ai.state !== S.DEAD) setState(ai, S.CRAWL);
 
   // perception transitions
-  if (ctx.canSee && ai.state !== S.ATTACK && ai.state !== S.STAGGER && ai.state !== S.KNOCKDOWN) {
+  if (ctx.canSee && ai.state !== S.ATTACK && ai.state !== S.STAGGER && ai.state !== S.KNOCKDOWN && ai.state !== S.CRAWL) {
     if (!ai.alerted) {
       ai.alerted = true;
       if (ctx.screamer && ai.screamCd <= 0) { out.scream = true; ai.screamCd = 8; }

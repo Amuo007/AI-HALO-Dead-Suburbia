@@ -217,7 +217,7 @@ function updateZombieAI(z, dt, frame) {
     out.moveX += -dz / (dist || 1) * s * 0.6; out.moveZ += dx / (dist || 1) * s * 0.6;
   }
   // brute charge
-  if (ts.charge && z.ai.state === S.CHASE && dist > 5) out.speed = (out.speed || 1) * 1.8;
+  if (ts.charge && z.ai.state === S.CHASE && dist > 5) { out.speed = (out.speed || 1) * 1.8; if (Math.random() < dt * 0.15 && dist < 20) audio.roar(); }
   // runner zigzag when player aims at it
   if (ts.zigzag && dist < 18) {
     const camF = new THREE.Vector3(0, 0, -1).applyEuler(camera.rotation);
@@ -331,7 +331,7 @@ function bloaterExplode(z) {
     new THREE.MeshBasicMaterial({ color: 0x8aff5a, transparent: true, opacity: 0.9, side: THREE.DoubleSide, blending: THREE.AdditiveBlending }));
   ring.rotation.x = -Math.PI / 2; ring.position.copy(p).setY(0.1);
   scene.add(ring); shockwaves.push({ m: ring, life: 0.5 });
-  audio.explosion();
+  audio.bloaterPop();
   const d = Math.hypot(player.pos.x - p.x, player.pos.z - p.z);
   if (d < 5) damagePlayer(40 * (1 - d / 5), p);
   for (const o of zombies) {
@@ -608,6 +608,7 @@ function onZombieDeath(zom, zone, dir) {
   }
   if (streakCount >= 2 && streakTimer > 0) showStreak(streakCount);
   audio.kill();
+  if (zone === 'head') audio.headshot();
   directorNoteKill(director, clock.elapsedTime);
   if (Math.random() < 0.12) spawnPickup(zom.root.position.x, zom.root.position.z, ['ammo', 'health', 'grenade'][Math.floor(Math.random() * 3)]);
   updateHudTop();
@@ -673,35 +674,35 @@ function spawnDmgNum(worldPos, dmg, head) {
   dmgNums.push({ el: d, pos: worldPos.clone(), life: 0.8, vy: 1.2 });
 }
 
-// ---------- audio stubs (full synth in stage 6) ----------
+// ---------- audio ----------
+import { initAudio, sfx, setVolume, setMuted, updateListener, setDroneIntensity } from './audio.js';
 const audio = {
-  ctx: null, muted: false,
-  ensure() { if (!this.ctx) this.ctx = new (window.AudioContext || window.webkitAudioContext)(); return this.ctx; },
-  blip(freq, dur, type = 'square', vol = 0.08) {
-    if (this.muted) return;
-    try {
-      const c = this.ensure(); const o = c.createOscillator(); const g = c.createGain();
-      o.type = type; o.frequency.value = freq; g.gain.value = vol * this.vol;
-      g.gain.exponentialRampToValueAtTime(0.001, c.currentTime + dur);
-      o.connect(g).connect(c.destination); o.start(); o.stop(c.currentTime + dur);
-    } catch (e) {}
-  },
-  shot(id) { this.blip(id === 'shotgun' ? 90 : id === 'rifle' ? 160 : 220, 0.09, 'sawtooth', 0.12); },
-  dry() { this.blip(900, 0.04, 'square', 0.05); },
-  emptyClick() { this.blip(700, 0.03, 'square', 0.04); },
-  hit() { this.blip(500, 0.05, 'triangle', 0.06); },
-  kill() { this.blip(300, 0.12, 'triangle', 0.07); },
-  reload() { this.blip(400, 0.06, 'square', 0.05); },
-  scream() { this.blip(1400, 0.5, 'sawtooth', 0.1); },
-  spit() { this.blip(200, 0.2, 'sine', 0.06); },
-  explosion() { this.blip(60, 0.5, 'sawtooth', 0.2); },
-  hurt() { this.blip(150, 0.2, 'triangle', 0.1); },
-  woodBreak() { this.blip(120, 0.15, 'square', 0.08); },
-  groan() { this.blip(80 + Math.random() * 40, 0.6, 'sine', 0.04); },
-  melee() { this.blip(250, 0.08, 'triangle', 0.07); },
-  pickup() { this.blip(880, 0.12, 'sine', 0.07); },
-  vol: 0.8,
+  ensure() { initAudio(); },
+  shot(id) { sfx.shot(id); },
+  dry() { sfx.dry(); },
+  emptyClick(p) { sfx.emptyClick(p); },
+  hit() { sfx.hit(); },
+  kill() { sfx.kill(); },
+  reload() { sfx.reloadIn(); },
+  scream() { sfx.scream(); },
+  spit() { sfx.spit(); },
+  explosion() { sfx.explosion(); },
+  hurt() { sfx.hurt(); },
+  woodBreak() { sfx.woodBreak(); },
+  groan(x, y, z) { sfx.groan(x, y, z); },
+  melee() { sfx.melee(); },
+  pickup() { sfx.pickup(); },
+  clink() { sfx.clink(); },
+  footstep(s) { sfx.footstep(s); },
+  heartbeat() { sfx.heartbeat(); },
+  headshot() { sfx.headshot(); },
+  roar() { sfx.roar(); },
+  bloaterPop() { sfx.bloaterPop(); },
+  set vol(v) { setVolume(v); },
+  set muted(m) { setMuted(m); },
+  get muted() { return false; },
 };
+let footT = 0, clinkT = 0, heartT = 0;
 
 // ---------- input / player ----------
 let playerMoving = false;
@@ -796,6 +797,7 @@ let flashlightOn2 = false;
 let highScore = +(localStorage.getItem('ds-highscore') || 0);
 
 function startGame() {
+  initAudio();
   $('startScreen').classList.remove('on');
   $('hud').classList.add('on');
   gameState = 'playing';
@@ -1053,7 +1055,7 @@ async function init() {
     player.pos.set(sx, 0, sz);
     if (VIEW === 'zombies') player.pos.set(0, 0, 0.5);
     player.yaw = 0; player.pitch = -0.05;
-    $('hud').classList.add('on');
+    if (DEMO) $('hud').classList.add('on');
     updateHudWeapon(); updateHudTop();
   }
 
@@ -1088,6 +1090,20 @@ async function init() {
   placeCrates();
   if (params.has('wave')) setTimeout(() => { gameState = 'playing'; startWave(1); }, 300);
   if (params.has('buy')) setTimeout(() => { score = 1200; gameState = 'buy'; openBuy(); }, 300);
+  if (params.has('z50')) {
+    gameState = 'playing';
+    for (let i = 0; i < 50; i++) {
+      const a = Math.random() * Math.PI * 2, r = 8 + Math.random() * 14;
+      const z = spawnZombie(player.pos.x + Math.sin(a) * r, player.pos.z + Math.cos(a) * r, i % 2 ? skinA : skinC, { type: 'walker' });
+      z.ai.alerted = true; z.ai.state = S.CHASE;
+    }
+    let frames = 0, t0 = performance.now();
+    const iv = setInterval(() => {
+      frames++;
+      if (performance.now() - t0 > 2000) { console.log('[perf] fps~', Math.round(frames / 2)); clearInterval(iv); }
+    }, 0);
+    requestAnimationFrame(function cnt() { frames++; requestAnimationFrame(cnt); });
+  }
   console.log('[main] ready'); window.__gameReady = true;
 }
 init().catch(e => console.error('[init failed]', e && e.stack || e));
@@ -1244,12 +1260,25 @@ function loop() {
     if (breakT <= 0) { $('buyMenu').classList.remove('on'); gameState = 'playing'; canvas.requestPointerLock?.(); startWave(wave + 1); }
   }
   mmT -= dt; if (mmT <= 0 && gameState !== 'menu') { drawMinimap(); mmT = 0.15; }
-  // ambient groans near zombies
-  if (Math.random() < dt * 0.4) {
-    let near = null, nd = 1e9;
-    for (const z of zombies) { if (!z.stats.alive) continue; const d = z.root.position.distanceTo(camera.position); if (d < nd) { nd = d; near = z; } }
-    if (near && nd < 20) audio.groan();
+  // 3D groans + drone intensity + footsteps + heartbeat
+  {
+    let near = null, nd = 1e9, aliveN = 0;
+    for (const z of zombies) { if (!z.stats.alive) continue; aliveN++; const d = z.root.position.distanceTo(camera.position); if (d < nd) { nd = d; near = z; } }
+    setDroneIntensity(aliveN / 30 + hordeAlert);
+    hordeAlert = Math.max(0, hordeAlert - dt);
+    if (near && nd < 22 && Math.random() < dt * 0.5) {
+      const gp = near.root.position;
+      audio.groan(gp.x, 1.2, gp.z);
+    }
   }
+  if (moving && player.onGround) { footT -= dt; if (footT <= 0) { audio.footstep(player.sprinting); footT = player.sprinting ? 0.28 : 0.42; } }
+  clinkT -= dt;
+  if (clinkT <= 0 && fx.shells.some(sh => sh.m.visible && sh.settled && !sh.clinked)) {
+    for (const sh of fx.shells) if (sh.m.visible && sh.settled && !sh.clinked) { sh.clinked = true; audio.clink(); break; }
+    clinkT = 0.05;
+  }
+  if (player.health < 30 && gameState === 'playing') { heartT -= dt; if (heartT <= 0) { audio.heartbeat(); heartT = 1.1; } }
+  updateListener(camera.position, new THREE.Vector3(0, 0, -1).applyEuler(camera.rotation));
 
   // HUD timers
   if (hmTimer > 0) { hmTimer -= dt; if (hmTimer <= 0) $('hitmarker').style.opacity = 0; }
